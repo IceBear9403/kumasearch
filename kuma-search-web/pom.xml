@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>com.kuma</groupId>
+        <artifactId>kuma-search</artifactId>
+        <version>1.0.0-SNAPSHOT</version>
+    </parent>
+
+    <artifactId>kuma-search-web</artifactId>
+    <name>kuma-search-web</name>
+    <description>启动模块：聚合 core + admin，打包为可执行 fat jar</description>
+
+    <dependencies>
+        <dependency>
+            <groupId>com.kuma</groupId>
+            <artifactId>kuma-search-admin</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-actuator</artifactId>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <finalName>kuma-search</finalName>
+        <plugins>
+            <!--
+                这里不显式声明 <executions>。
+                spring-boot-starter-parent 已经把 spring-boot-maven-plugin 的 repackage
+                目标绑定到 package 阶段；再声明一次同一个 goal 会让 repackage **执行两遍**
+                （构建日志里能看到两次 "Repackaging ... as ...jar"）。
+                第二遍是在第一遍产出的 fat jar 上再打一次，虽然结果碰巧正确，
+                但每次构建都多花一份时间，且会掩盖"插件到底绑了几次"这个事实。
+                保留这个 plugin 声明本身是必要的 —— 它让这个模块与其它模块的区别一目了然。
+            -->
+            <plugin>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-maven-plugin</artifactId>
+            </plugin>
+        </plugins>
+    </build>
+</project>

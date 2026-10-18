@@ -1,0 +1,3 @@
+com/kuma/search/web/health/EsHealthIndicator.class
+com/kuma/search/web/KumaSearchApplication.class
+com/kuma/search/web/filter/RequestIdFilter.class

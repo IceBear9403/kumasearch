@@ -1,0 +1,109 @@
+<!--
+  KumaSearch 验证码邮件模板。
+
+  ⚠️ 占位符的完整清单、渲染规则与校验方式写在 EmailCodeTemplate 的类注释里。
+     本文件里**不要**再写任何双花括号示例（包括注释里），
+     因为渲染器把「渲染后仍残留双花括号」视为模板错误并直接失败。
+
+  # 为什么写成 HTML 表格而不是 div + flex
+
+  邮件客户端不是浏览器。Outlook 桌面版用 Word 的排版引擎，不认识 flex/grid；
+  `<style>` 标签里的规则在 Gmail 的某些场景会被整块剥掉。
+  表格布局 + 行内样式是唯一在各家客户端都稳定的写法 ——
+  改版式时请沿用这条约束，不要"顺手现代化"。
+
+  # 配色取自站点
+
+  #409eff（主色）、#ecf5ff 与 #d9ecff（主色浅底）、#303133 与 #606266（正文）、
+  #909399（次要文字）、#f5f7fa（页面底色）、#ebeef5 与 #f0f2f5（描边）。
+  改站点主题色时这个文件要跟着改 —— 邮件是唯一一处不在 Vue 组件体系里的界面。
+
+  # 图片资产
+
+  品牌图标用的是 cid 内联的 bear-paw.png（144×144 源图，显示 40×40）。
+  不要改成外链 URL：Gmail 默认不加载远程图片，收件人看到的会是一个灰色占位框。
+-->
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <meta name="supported-color-schemes" content="light">
+  <title>{{siteName}}</title>
+</head>
+<body style="margin:0;padding:0;background-color:#f5f7fa;">
+
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0"
+       style="background-color:#f5f7fa;">
+  <tr>
+    <td align="center" style="padding:32px 12px;">
+
+      <!-- ============ 卡片 ============ -->
+      <table role="presentation" width="520" cellpadding="0" cellspacing="0" border="0"
+             style="width:520px;max-width:520px;background-color:#ffffff;border:1px solid #ebeef5;border-radius:8px;">
+
+        <!-- 品牌行：熊爪印 + 站点名 -->
+        <tr>
+          <td style="padding:22px 32px 16px 32px;border-bottom:1px solid #f0f2f5;">
+            {{logo}}<span style="display:inline-block;vertical-align:middle;font-family:'Helvetica Neue',Helvetica,'PingFang SC','Hiragino Sans GB','Microsoft YaHei',Arial,sans-serif;font-size:18px;font-weight:600;color:#409eff;letter-spacing:1px;">{{siteName}}</span>
+          </td>
+        </tr>
+
+        <!-- 标题与场景说明 -->
+        <tr>
+          <td style="padding:26px 32px 0 32px;font-family:'Helvetica Neue',Helvetica,'PingFang SC','Hiragino Sans GB','Microsoft YaHei',Arial,sans-serif;">
+            <div style="font-size:20px;font-weight:600;color:#303133;line-height:1.5;">{{sceneLabel}}验证码</div>
+            <div style="padding-top:10px;font-size:14px;color:#606266;line-height:1.7;">{{sceneIntro}}</div>
+          </td>
+        </tr>
+
+        <!-- 验证码 -->
+        <tr>
+          <td style="padding:22px 32px 0 32px;">
+            <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0"
+                   style="background-color:#ecf5ff;border:1px solid #d9ecff;border-radius:6px;">
+              <tr>
+                <!-- 负的右边距抵消 letter-spacing 在最后一个字符后留下的空隙，否则整串会偏左 -->
+                <td align="center" style="padding:18px 8px;">
+                  <span style="display:inline-block;margin-right:-8px;font-family:Menlo,Consolas,'Courier New',monospace;font-size:34px;font-weight:700;color:#409eff;letter-spacing:8px;">{{code}}</span>
+                </td>
+              </tr>
+            </table>
+          </td>
+        </tr>
+
+        <!-- 有效期 -->
+        <tr>
+          <td style="padding:12px 32px 0 32px;font-family:'Helvetica Neue',Helvetica,'PingFang SC','Hiragino Sans GB','Microsoft YaHei',Arial,sans-serif;font-size:13px;color:#909399;line-height:1.7;">
+            验证码 <span style="color:#f56c6c;font-weight:600;">{{minutes}} 分钟</span> 内有效，请勿转发给任何人。
+          </td>
+        </tr>
+
+        <tr>
+          <td style="padding:22px 32px 0 32px;">
+            <div style="height:1px;line-height:1px;font-size:0;background-color:#f0f2f5;">&nbsp;</div>
+          </td>
+        </tr>
+
+        <!-- 安全说明 -->
+        <tr>
+          <td style="padding:16px 32px 26px 32px;font-family:'Helvetica Neue',Helvetica,'PingFang SC','Hiragino Sans GB','Microsoft YaHei',Arial,sans-serif;font-size:13px;color:#909399;line-height:1.8;">
+            如果这不是您本人的操作，请忽略本邮件，您的账号不会有任何风险。<br>
+            本邮件由系统自动发送，请勿直接回复。
+          </td>
+        </tr>
+
+      </table>
+      <!-- ============ /卡片 ============ -->
+
+      <div style="padding-top:16px;font-family:'Helvetica Neue',Helvetica,'PingFang SC','Hiragino Sans GB','Microsoft YaHei',Arial,sans-serif;font-size:12px;color:#a8abb2;">
+        &copy; {{year}} {{siteName}}
+      </div>
+
+    </td>
+  </tr>
+</table>
+
+</body>
+</html>

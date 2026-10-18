@@ -1,0 +1,111 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>com.kuma</groupId>
+        <artifactId>kuma-search</artifactId>
+        <version>1.0.0-SNAPSHOT</version>
+    </parent>
+
+    <artifactId>kuma-search-core</artifactId>
+    <name>kuma-search-core</name>
+    <description>
+        核心层：ES 访问网关、动态索引管理、检索与建议服务、二级缓存、写入事件抽象、同步任务。
+        有意【不依赖 Spring Security 与 spring-boot-starter-web】，以便后期把检索能力独立部署为 K8s 中的一个 service。
+    </description>
+
+    <dependencies>
+        <dependency>
+            <groupId>com.kuma</groupId>
+            <artifactId>kuma-search-common</artifactId>
+        </dependency>
+
+        <!-- ===== Elasticsearch 官方 Java API Client（版本由 Boot BOM 管理为 8.18.8） ===== -->
+        <dependency>
+            <groupId>co.elastic.clients</groupId>
+            <artifactId>elasticsearch-java</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.elasticsearch.client</groupId>
+            <artifactId>elasticsearch-rest-client</artifactId>
+        </dependency>
+
+        <!-- ===== 持久层 ===== -->
+        <dependency>
+            <groupId>com.baomidou</groupId>
+            <artifactId>mybatis-plus-spring-boot3-starter</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>com.baomidou</groupId>
+            <artifactId>mybatis-plus-jsqlparser</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>com.mysql</groupId>
+            <artifactId>mysql-connector-j</artifactId>
+            <scope>runtime</scope>
+        </dependency>
+
+        <!-- ===== 缓存：Redis（L2） + Caffeine（L1） ===== -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-data-redis</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-cache</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>com.github.ben-manes.caffeine</groupId>
+            <artifactId>caffeine</artifactId>
+        </dependency>
+
+        <!-- 连接池 + 定时任务所需的 Spring 基础能力 -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>com.zaxxer</groupId>
+            <artifactId>HikariCP</artifactId>
+        </dependency>
+
+        <!--
+          ===== HTML 解析：网页采集的正文抽取 =====
+
+          只被 JsoupContentExtractor 使用。采集链路上的其它部分（抓取、robots、
+          归一化、指纹、敏感词）都不需要它，因此这个依赖的存在范围是明确的。
+
+          正则实现（RegexContentExtractor）保留未删：它零依赖、对结构规范的页面够用，
+          而且它是"抽取失败"这条路径上被反复验证过的对照组。
+          两者由 kuma.crawl.extractor 二选一装配，判定写在两个实现类的
+          @ConditionalOnProperty 上（互斥的两个条件，不会同时出现两个 Bean）。
+-->
+        <dependency>
+            <groupId>org.jsoup</groupId>
+            <artifactId>jsoup</artifactId>
+        </dependency>
+
+        <!--
+          ===== 接口文档注解：只有 @Schema / @Operation 这些注解，没有实现 =====
+
+          存在的唯一理由是 core 里的 DTO 是**对外接口的真实契约**
+          （检索的请求体与响应体全在这里），字段含义不写在 DTO 上、
+          只写在 docs/04-api-design.md 里，等于让看文档页的人必须再开一个文件对照。
+
+          <optional>true</optional> 而不是普通编译依赖，是刻意的：
+          这个模块的定位是「将来可以独立部署为一个 service」，而那个 service 未必带文档组件。
+          optional 意味着依赖不会传递给下游模块（运行期的 swagger-annotations
+          由 kuma-search-admin 的 springdoc 传递引入）。
+          注解类在运行期缺失是安全的：JVM 对**无法解析的注解**是静默丢弃，
+          不会像方法引用那样抛 NoClassDefFoundError。
+        -->
+        <dependency>
+            <groupId>io.swagger.core.v3</groupId>
+            <artifactId>swagger-annotations-jakarta</artifactId>
+            <optional>true</optional>
+        </dependency>
+    </dependencies>
+</project>

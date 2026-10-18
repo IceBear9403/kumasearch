@@ -1,0 +1,270 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-parent</artifactId>
+        <version>3.5.16</version>
+        <relativePath/>
+    </parent>
+
+    <groupId>com.kuma</groupId>
+    <artifactId>kuma-search</artifactId>
+    <version>1.0.0-SNAPSHOT</version>
+    <packaging>pom</packaging>
+
+    <name>kuma-search</name>
+    <description>KumaSearch —— 轻量级通用多类型搜索引擎</description>
+
+    <modules>
+        <module>kuma-search-common</module>
+        <module>kuma-search-core</module>
+        <module>kuma-search-admin</module>
+        <module>kuma-search-web</module>
+    </modules>
+
+    <properties>
+        <!-- JDK 17 基线。升级 JDK 21 见 docs/07-deployment.md（可启用虚拟线程） -->
+        <java.version>17</java.version>
+        <!--
+          【不要删除这一行】它与下面的 java.version 是重复的，但重复是必要的。
+
+          java.version 是 Spring Boot 的私有约定，只有 spring-boot-starter-parent 会把它映射成
+          编译用的 release 参数；而 maven.compiler.release 是 Maven 的官方属性，任何工具（IDE 的
+          Java 语言服务器、其它构建工具、只读 pom 不做 parent 解析的分析器）都认它。
+
+          只写 java.version 时，一旦某个工具没能完整解析 parent（IDE 索引未就绪、离线、pom 被
+          单独打开等），它就会退回自己的默认合规级别。踩过的坑：IDE 用 Java 25 合规级别把 class
+          文件编译成 major version 69 写进 target/classes，覆盖掉 Maven 产出的 61，于是运行时
+          报 "class file version 69.0 ... only recognizes class file versions up to 61.0"。
+        -->
+        <maven.compiler.release>${java.version}</maven.compiler.release>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
+
+        <!--
+          版本说明（务必先读）：
+          - elasticsearch-java / elasticsearch-rest-client 由 Spring Boot 3.5.16 的 BOM 统一管理为 8.18.8，
+            与 ES 服务端 8.18.x 对齐，因此本项目【不重复声明】这两个版本号。
+            升级 ES 时只需改 spring-boot-starter-parent 版本。
+          - jakarta-json-api 同样由 Boot BOM 管理为 2.1.3，满足 ES Java Client 的
+            jakarta.json.spi.JsonProvider 要求，无需手工提升。
+            （若把 Boot 降到 3.3 以下，则需显式提升 jakarta.json-api 到 2.1.3+，否则 ES 客户端启动报 ClassNotFoundException。）
+        -->
+        <mybatis-plus.version>3.5.17</mybatis-plus.version>
+        <jjwt.version>0.12.7</jjwt.version>
+        <!--
+          接口文档（Swagger UI）。
+
+          版本选定为 2.9.1，判据不是"最新"而是**它能与 Spring Boot 3.5.16 精确对齐**：
+          springdoc 2.9.1 自己的 parent 就是 spring-boot-starter-parent 3.5.16，
+          与本项目一字不差。这一项必须每次升级 Boot 时重新核对 —— springdoc 与
+          Spring Framework 是紧耦合的，踩过的坑是它内部用反射取
+          org.springframework.web.method.ControllerAdviceBean 的构造器，
+          该构造器在 Spring Framework 6.2（Boot 3.4）改过签名，
+          于是 springdoc < 2.7 在 Boot 3.4+ 上**启动正常、一打开文档页才抛 NoSuchMethodError**。
+
+          【为什么不用 knife4j】根 pom 里曾有一行从未被任何模块引用的
+          knife4j.version=4.5.0。knife4j 4.5.0 内部依赖 springdoc 2.2.x，
+          正好落在上面那个不兼容区间里；要用它得自己排除并锁 springdoc 版本，
+          相当于为了一个皮肤多维护一套版本约束。原生 Swagger UI 已经足够看清全部接口。
+
+          升级 Boot 时的核对方法（一条命令，别凭印象）：
+            curl -s https://repo1.maven.org/maven2/org/springdoc/springdoc-openapi/<新版本>/springdoc-openapi-<新版本>.pom \
+              | grep -A2 spring-boot-starter-parent
+          输出里的 <version> 应当与本项目的 spring-boot-starter-parent 版本一致。
+        -->
+        <springdoc.version>2.9.1</springdoc.version>
+        <!--
+          swagger-annotations 的版本（@Schema / @Operation 这些注解所在的 jar）。
+          它**不在 Spring Boot BOM 的管理范围内**，只能自己写死；
+          取值必须与上面的 springdoc 内部依赖的 swagger-core-jakarta 对齐，否则会出现
+          "注解类被两个不同版本同时加载"的经典问题（表现是文档页里字段说明时有时无）。
+          核对方法：
+            curl -s https://repo1.maven.org/maven2/org/springdoc/springdoc-openapi/<springdoc 版本>/springdoc-openapi-<版本>.pom \
+              | grep swagger-api.version
+          2.9.1 对应的是 2.2.55。
+        -->
+        <swagger-api.version>2.2.55</swagger-api.version>
+        <jsoup.version>1.23.2</jsoup.version>
+        <aj-captcha.version>2.0.0</aj-captcha.version>
+    </properties>
+
+    <dependencyManagement>
+        <dependencies>
+            <!-- ===== 内部模块 ===== -->
+            <dependency>
+                <groupId>com.kuma</groupId>
+                <artifactId>kuma-search-common</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>com.kuma</groupId>
+                <artifactId>kuma-search-core</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>com.kuma</groupId>
+                <artifactId>kuma-search-admin</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+
+            <!--
+              注意：Elasticsearch 相关依赖【刻意不写在这里】。
+              原因：在子 POM 自己的 dependencyManagement 中声明一个无版本号的条目，
+              会【覆盖】而不是继承父 BOM 里已有的版本管理，导致 "version is missing" 构建失败。
+              正确做法是让 spring-boot-dependencies 继续管理它们 —— Boot 3.5.16 已把
+              co.elastic.clients:elasticsearch-java 与 org.elasticsearch.client:elasticsearch-rest-client
+              统一管理为 elasticsearch-client.version = 8.18.8，与 ES 服务端 8.18.x 对齐。
+              各模块直接版本无关地引入即可，升级 ES 只需改本文件的 spring-boot-starter-parent 版本。
+
+              同时我们【不引入】spring-boot-starter-data-elasticsearch：
+              本项目的索引是「配置驱动的动态多类型索引」，SDE 的实体/Repository 绑定反而是负担，
+              只用 Java API Client + Low Level RestClient，DSL 完全可控。
+            -->
+
+            <!-- ===== 持久层 MyBatis-Plus ===== -->
+            <dependency>
+                <groupId>com.baomidou</groupId>
+                <artifactId>mybatis-plus-spring-boot3-starter</artifactId>
+                <version>${mybatis-plus.version}</version>
+            </dependency>
+            <!-- MyBatis-Plus 3.5.9+ 把 JSqlParser 拆成独立依赖，分页插件必须显式引入 -->
+            <dependency>
+                <groupId>com.baomidou</groupId>
+                <artifactId>mybatis-plus-jsqlparser</artifactId>
+                <version>${mybatis-plus.version}</version>
+            </dependency>
+
+            <!-- ===== JWT ===== -->
+            <dependency>
+                <groupId>io.jsonwebtoken</groupId>
+                <artifactId>jjwt-api</artifactId>
+                <version>${jjwt.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>io.jsonwebtoken</groupId>
+                <artifactId>jjwt-impl</artifactId>
+                <version>${jjwt.version}</version>
+                <scope>runtime</scope>
+            </dependency>
+            <dependency>
+                <groupId>io.jsonwebtoken</groupId>
+                <artifactId>jjwt-jackson</artifactId>
+                <version>${jjwt.version}</version>
+                <scope>runtime</scope>
+            </dependency>
+
+            <!-- ===== HTML 解析（网页采集的正文抽取） ===== -->
+            <dependency>
+                <groupId>org.jsoup</groupId>
+                <artifactId>jsoup</artifactId>
+                <version>${jsoup.version}</version>
+            </dependency>
+
+            <!-- ===== 接口文档（Swagger UI） ===== -->
+            <dependency>
+                <groupId>org.springdoc</groupId>
+                <artifactId>springdoc-openapi-starter-webmvc-ui</artifactId>
+                <version>${springdoc.version}</version>
+            </dependency>
+            <!--
+              只有注解，没有实现。给 kuma-search-core 的 DTO 用 —— core 刻意不依赖 web，
+              为了给 DTO 字段写 @Schema 说明而把整个文档组件拖进 core 是本末倒置。
+              这个 jar 里全是 RUNTIME 保留的注解，没有任何运行期逻辑。
+            -->
+            <dependency>
+                <groupId>io.swagger.core.v3</groupId>
+                <artifactId>swagger-annotations-jakarta</artifactId>
+                <version>${swagger-api.version}</version>
+            </dependency>
+
+            <!--
+              ===== 滑块验证码 =====
+
+              ⚠️ 这里【刻意只引入 captcha 核心包，不引入 captcha-spring-boot-starter】。
+
+              原因是 starter 在当前版本（1.4.0 与 2.0.0 都一样）是基于
+              spring-boot-starter-parent 2.7.14 构建的，它的自动配置写在
+              META-INF/spring.factories 里 —— 而 Spring Boot 3 已经不再读这个文件
+              （改为读 META-INF/spring/...AutoConfiguration.imports）。
+              结果不是"启动报错"，而是**自动配置静默失效**：没有 CaptchaService Bean，
+              应用启动时才在注入处失败，或者更糟——配了 redis 缓存却悄悄退回内存实现。
+              这类"依赖看起来装上了、功能却没生效"的问题在联调阶段极难定位。
+
+              只引核心包的可行性已经实测确认：
+                · 核心 jar 内**不含任何 javax.servlet / jakarta.servlet 引用**，
+                  也就是说它没有自带控制器，是"自带 controller"的形态 ——
+                  正好与本项目已有的 CaptchaController 对上（我们自己包 R<> 统一响应体）；
+                · 它的编译期与运行期依赖为空（slf4j 是 provided、junit 是 test），
+                  对本项目是零传递依赖；
+                · 底图与字体（fonts/、defaultImages/）都在核心 jar 内，
+                  不需要额外配置路径，也不依赖操作系统安装中文字体。
+              因此下面的依赖不需要 <exclusions>。
+            -->
+            <dependency>
+                <groupId>com.anji-plus</groupId>
+                <artifactId>captcha</artifactId>
+                <version>${aj-captcha.version}</version>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
+
+    <dependencies>
+        <!-- 全模块通用：Lombok + 测试 -->
+        <dependency>
+            <groupId>org.projectlombok</groupId>
+            <artifactId>lombok</artifactId>
+            <optional>true</optional>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <pluginManagement>
+            <plugins>
+                <plugin>
+                    <groupId>org.springframework.boot</groupId>
+                    <artifactId>spring-boot-maven-plugin</artifactId>
+                    <configuration>
+                        <excludes>
+                            <exclude>
+                                <groupId>org.projectlombok</groupId>
+                                <artifactId>lombok</artifactId>
+                            </exclude>
+                        </excludes>
+                    </configuration>
+                </plugin>
+            </plugins>
+        </pluginManagement>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <configuration>
+                    <!--
+                      显式声明 release，而不是依赖"父模块已经配过了"。
+                      <release> 同时约束语法级别、API 与 class 文件版本，比 source/target 组合严格
+                      （后者会允许编译器引用比目标版本更新的 JDK API，编译能过、运行才报错）。
+                      这里的值是 17，即 class 文件 major version 61 —— 与运行环境必须一致。
+                    -->
+                    <release>${java.version}</release>
+                    <annotationProcessorPaths>
+                        <path>
+                            <groupId>org.projectlombok</groupId>
+                            <artifactId>lombok</artifactId>
+                            <version>${lombok.version}</version>
+                        </path>
+                    </annotationProcessorPaths>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
+</project>

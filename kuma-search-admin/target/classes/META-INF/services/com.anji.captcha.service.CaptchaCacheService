@@ -1,0 +1,11 @@
+# AJ-Captcha 的缓存实现通过 java.util.ServiceLoader 发现（见上游 CaptchaServiceFactory 的静态块），
+# 不是通过 Spring 扫描 —— 上游那个类不属于 Spring 上下文，无法用 @Component 注册。
+#
+# 【不要删掉这个文件】。上游核心包自带的是 CaptchaCacheServiceMemImpl（进程内 Map），
+# 而本项目 kuma.captcha.cache-type=redis。少了这一行，ServiceLoader 里就没有 type()=="redis"
+# 的实现，CaptchaServiceFactory.getCache("redis") 返回 null，第一次取图才会 NPE ——
+# 一个启动时完全安静、上线后才暴露的故障。AjCaptchaConfig 里有一处启动自检专门拦这个问题。
+#
+# 同一个接口在多个 jar 里各有一份该文件是允许的：ServiceLoader 会把它们全部读出来合并，
+# 而不是只取先找到的那一份。因此这里不需要（也不能）去覆盖上游那份。
+com.kuma.search.admin.captcha.RedisCaptchaCacheService

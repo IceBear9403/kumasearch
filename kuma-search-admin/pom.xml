@@ -1,0 +1,84 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>com.kuma</groupId>
+        <artifactId>kuma-search</artifactId>
+        <version>1.0.0-SNAPSHOT</version>
+    </parent>
+
+    <artifactId>kuma-search-admin</artifactId>
+    <name>kuma-search-admin</name>
+    <description>接口层：REST 控制器（搜索 + 管理后台）、JWT 认证、RBAC 鉴权</description>
+
+    <dependencies>
+        <dependency>
+            <groupId>com.kuma</groupId>
+            <artifactId>kuma-search-core</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-web</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-security</artifactId>
+        </dependency>
+
+        <!--
+          接口文档：springdoc + 自带 Swagger UI（访问 /swagger-ui.html）。
+          版本选型与"为什么不用 knife4j"写在根 pom 的 springdoc.version 属性上，改动前先读那段。
+
+          ⚠️ 这个依赖在这里是**必须**的、不能换到 core 去：它带 spring-boot-starter-web 的
+          自动配置（Controller 扫描 + Jackson），而 core 刻意不依赖 web。
+
+          ⚠️ 它引入的端点（/swagger-ui/**、/v3/api-docs/**）默认是开的，
+          由 kuma.swagger.enabled 统一控制（见 application.yml 与 SwaggerConfig）：
+          本地开发打开，生产默认关 —— 关掉时 springdoc 不注册任何 handler，
+          路径直接 404，但 SecurityConfig 里那几条放行仍然留着（无害，且省得两处联动改）。
+        -->
+        <dependency>
+            <groupId>org.springdoc</groupId>
+            <artifactId>springdoc-openapi-starter-webmvc-ui</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>io.jsonwebtoken</groupId>
+            <artifactId>jjwt-api</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.jsonwebtoken</groupId>
+            <artifactId>jjwt-impl</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.jsonwebtoken</groupId>
+            <artifactId>jjwt-jackson</artifactId>
+        </dependency>
+
+        <!--
+          滑块验证码。只引核心包，理由（尤其是"为什么不用 starter"）写在根 pom 的
+          dependencyManagement 里，改动前务必先读那一段。
+        -->
+        <dependency>
+            <groupId>com.anji-plus</groupId>
+            <artifactId>captcha</artifactId>
+        </dependency>
+
+        <!--
+          邮件发送。提供默认的 SMTP 实现 SpringMailSender（kuma.auth.email.provider=smtp）。
+
+          ⚠️ 阿里云 DirectMail 那条路**不用**这个依赖：AliyunDirectMailSender 走的是
+          DirectMail 的 HTTP RPC 接口 + 手写 HMAC-SHA1 签名，只需要 JDK 自带的
+          HttpClient。两条路都保留是刻意的 —— 见 MailSender 的类注释，
+          换发信方式只换实现类，EmailCodeService 一行不动。
+        -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-mail</artifactId>
+        </dependency>
+    </dependencies>
+</project>

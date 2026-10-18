@@ -1,0 +1,709 @@
+# =====================================================================================
+#  KumaSearch 主配置
+#
+#  约定：所有**敏感值**一律写成 ${ENV_VAR:default} 的形式，默认值仅供本地开发使用。
+#  生产部署时通过环境变量注入真实值，绝不要把生产密码写进这个文件并提交。
+#  完整的配置项清单与环境变量对照表见 docs/07-deployment.md。
+# =====================================================================================
+
+server:
+  port: 18082
+  # 优雅停机：收到 SIGTERM 后先停止接收新请求，等在途请求处理完再退出。
+  # 这是 K8s 滚动更新不丢请求的前提 —— 默认行为是立刻中断，正在执行中的搜索会返回 502。
+  shutdown: graceful
+
+  tomcat:
+    # =================================================================================
+    #  真实客户端 IP 的还原（配合 kuma.rate-limit 使用，两者必须一起上线）
+    #
+    #  应用代码一律用 request.getRemoteAddr() 取 IP，**不读 X-Forwarded-For**
+    #  （见 SearchController#clientIp 与 AuthController#clientIp）。这样做的代价是：
+    #  应用在 Nginx 后面时 getRemoteAddr() 拿到的是 127.0.0.1，所有用户共用一个限流桶。
+    #  解决办法不是回到"读请求头"，而是让容器（而不是应用代码）去信任可信代理的转发头。
+    # =================================================================================
+    remoteip:
+      # Nginx 追加的客户端地址。Tomcat 会据此改写 getRemoteAddr() 的返回值。
+      remote-ip-header: X-Forwarded-For
+      protocol-header: X-Forwarded-Proto
+      # ------------------------------------------------------------------------------
+      # 【安全核心】只信任来自这些来源的转发头，其余一律忽略。
+      #
+      # 不配这一项的后果不是"IP 不准"，而是：任何客户端只要自己带一个
+      # X-Forwarded-For 头，就能决定自己被记成哪个 IP —— 于是他每次请求换一个值，
+      # 限流桶每次都全新，限流形同不存在，写进 t_search_log 的 IP 也全是伪造的。
+      # 也就是说：**这一项漏配，等于限流被关掉了，而且没有任何报错。**
+      #
+      # 默认只信任本机（Nginx 与应用在同一台机器上，通过 127.0.0.1 转发）。
+      # ⚠️ 如果 Nginx 到应用之间还有其它代理（Docker 网桥、云负载均衡、跳板机），
+      #    必须把那一段的来源也加进来，否则限流会把所有用户算成同一个 IP 而误伤全部人。
+      #    放宽这一项 = 信任更多中间层，需要明确知道那一层会不会透传用户的原始头。
+      #    真实链路见 docs/07-deployment.md §五 5.4。
+      # ------------------------------------------------------------------------------
+      internal-proxies: ${KUMA_INTERNAL_PROXIES:127\.0\.0\.1|::1}
+
+spring:
+  application:
+    name: kuma-search
+  lifecycle:
+    # 等待在途请求结束的最长时间。设得太短会在滚动更新时丢请求，太长会拖慢发布。
+    timeout-per-shutdown-phase: 30s
+
+  datasource:
+    url: jdbc:mysql://8.142.176.238:13306/kuma_search?useUnicode=true&characterEncoding=utf8&serverTimezone=Asia/Shanghai&useSSL=false&allowPublicKeyRetrieval=true
+    username: root
+    password: kumadb
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    hikari:
+      # 连接池大小。经验公式约等于 (CPU 核数 * 2 + 磁盘数)；8 核机器上 20 条足够。
+      # 盲目调大反而更慢：MySQL 的活跃连接数上去了，每个查询的 CPU 时间片就少了。
+      maximum-pool-size: ${DB_POOL_SIZE:20}
+      minimum-idle: 5
+      connection-timeout: 30000
+      idle-timeout: 600000
+      max-lifetime: 1800000
+      # 连接有效性检测：MySQL 的 wait_timeout 默认 8 小时会悄悄掐掉空闲连接，
+      # 不检测的话，拿到死连接的那次请求会直接报错。
+      connection-test-query: SELECT 1
+
+  data:
+    redis:
+      host: 8.142.176.238
+      port: 16379
+      password: 1QAZ2wsx!@
+      database: ${REDIS_DATABASE:0}
+      timeout: 3000ms
+      lettuce:
+        pool:
+          max-active: 50
+          max-idle: 20
+          min-idle: 5
+
+  jackson:
+    date-format: yyyy-MM-dd HH:mm:ss
+    time-zone: Asia/Shanghai
+    # 序列化时忽略 null，避免响应体里塞满 "field": null
+    #
+    # ⚠️ 这条配置有一个必须知道的前端副作用：null 不是变成 null，而是**键整个消失**。
+    # 任何「可空字段」在前端都是 undefined 而不是 null，直接调 .toFixed() 之类会抛 TypeError，
+    # 而 Vue 的渲染错误会中止整棵子树的 patch（页面看起来是"卡住"）。
+    # 典型例子：ES 在字段排序时不给 _score —— 见 docs/09-maintenance.md §5.5 末尾。
+    default-property-inclusion: non_null
+
+  # ===================================================================================
+  #  定时任务线程池
+  #
+  #  Spring Boot 默认只给 @Scheduled 分配 **1 个线程**。本项目有 7 个定时任务，
+  #  其中两个耗时不可控：
+  #    - OutboxDispatchJob 每 1 秒一轮（kuma.mq.outbox-scan-interval-millis）；
+  #    - CrawlScheduler 每 30 秒一轮，但一轮要等整批 URL 抓完才返回
+  #      （batch-size=20、按域名串行、默认 qps=0.5 → 单域名一轮可达 40 秒以上）。
+  #  单线程下它们互相排队：一轮采集可以把 outbox 派发一起拖住（索引可见性变差），
+  #  反过来派发变慢时采集的轮次也会被推迟。表现出来就是"某个定时任务像是不动了"。
+  #
+  #  4 而不是更大：这些任务彼此独立、都是 I/O 密集型，4 个并发足够覆盖
+  #  「一个慢轮次不阻塞其它任务」这个目标；池子再大只会让同时打 MySQL/ES 的任务变多。
+  # ===================================================================================
+  task:
+    scheduling:
+      pool:
+        size: ${SCHEDULING_POOL_SIZE:4}
+
+  # ===================================================================================
+  #  邮件（仅 kuma.auth.email.provider=smtp 时生效；当前默认 provider 就是 smtp）
+  #
+  #  用的是 QQ 邮箱的 SMTP（smtp.qq.com:465，隐式 TLS）。
+  #
+  #  ⚠️ password 不是 QQ 密码，而是「授权码」：QQ 邮箱 → 设置 → 账户 →
+  #     POP3/IMAP/SMTP 服务 → 开启后生成的那串 16 位字符。
+  #     授权码会被用户在页面上重置、也可能因异地登录或频繁发信被作废，
+  #     那时这里就开始报「SMTP 认证失败」(535)。这属于正常的凭据轮换，
+  #     换一串新的即可，不用改代码。
+  #
+  #  ⚠️ 发件地址不在这一块里：它取 kuma.auth.email.account-name，
+  #     且必须与下面的 username 指向同一个真实邮箱，否则多数服务器会以
+  #     550/553「sender address rejected」拒收 —— 那是收信方的策略，与本项目无关。
+  #     QQ 的 SMTP 尤其严格：From 必须是登录账号本身。
+  #
+  #  ⚠️ QQ 个人邮箱的发信额度与频率阈值官方不公开（见 docs/07-deployment.md §十二），
+  #     `global-daily-limit` 因此取了一个保守值。要面向公众提供注册服务时，
+  #     应当换成商业发信服务 —— 靠一个个人邮箱发验证码，账号本身会成为风险点。
+  # ===================================================================================
+  mail:
+    host: ${MAIL_HOST:smtp.qq.com}
+    port: ${MAIL_PORT:465}
+    # 两个都带默认值是刻意的：这份配置的开箱目标是"能直接跑起来"。
+    # 换成自己的账号时，改环境变量即可，不必改这个文件。
+    username: ${MAIL_USERNAME:1749115603@qq.com}
+    password: ${MAIL_PASSWORD:avltdyxyhkoobhbf}
+    # 显式中文编码。SpringMailSender 在组装时也显式传了 UTF-8，这里是第二道保险：
+    # 该键的默认值是 US-ASCII，漏配会让中文主题在部分客户端变成一串问号，
+    # 而"主题乱码"在服务端日志里完全看不出来，只有收件人会发现。
+    default-encoding: UTF-8
+    properties:
+      mail.smtp.auth: true
+      # 465 = 隐式 TLS（SMTPS）。用 587 时必须改成 starttls.enable: true，
+      # 两个同时开会导致握手失败；只开一个。
+      mail.smtp.ssl.enable: true
+      mail.smtp.timeout: 10000
+      mail.smtp.connectiontimeout: 5000
+      mail.smtp.writetimeout: 10000
+  # ===================================================================================
+
+# =====================================================================================
+#  MyBatis-Plus
+# =====================================================================================
+mybatis-plus:
+  configuration:
+    # 下划线列名自动映射到驼峰属性（type_code -> typeCode）
+    map-underscore-to-camel-case: true
+    # 显式设置，避免某些驱动下 null 值被当作未设置而漏掉字段。
+    # 对增量同步尤其重要：把某个字段清空必须能被持久化，否则 ES 里会一直保留旧值。
+    jdbc-type-for-null: NULL
+  global-config:
+    banner: false
+    db-config:
+      id-type: auto
+      # 逻辑删除。所有实体上的 @TableLogic 都依赖这三个配置，
+      # 配错的话「删除」会变成物理删除，且不会有任何报错。
+      logic-delete-field: deleted
+      logic-delete-value: 1
+      logic-not-delete-value: 0
+
+# =====================================================================================
+#  KumaSearch 自定义配置
+# =====================================================================================
+kuma:
+  elasticsearch:
+    # 用 https:// 时，**必须**满足两点，否则客户端连不上（详见 docs/07-deployment.md §四 4.1）：
+    #   ① 签发 CA 在 JVM 信任库里 —— 已实测：465ma.com 的阿里云免费证书走 DigiCert 链
+    #      （CN=www.465ma.com ← Encryption Everywhere DV TLS CA - G2 ← DigiCert Global Root G2），
+    #      该根证书在 JDK 17 的 cacerts 里，客户端零改动即可连接；
+    #   ② 证书的 SAN 必须包含这里写的主机名 —— 这张证书是签给 465ma.com / www.465ma.com 的，
+    #      所以这里**只能写域名，不能再写 8.142.176.238**（公网 IP 不在 SAN 里，会报
+    #      "No subject alternative names matching IP address ... found"）。
+    #
+    # 9443 是 Nginx 终止 TLS 后转给 ES 的端口（Nginx 侧配置见 docs/07-deployment.md §六 步骤 4.1）。
+    # 为什么不让 ES 自己装证书：证书 90 天到期，放 Nginx 上续期只需换文件 + reload，ES 一行不动。
+    #
+    # 客户端【刻意不提供】关闭校验的开关 —— 在客户端关掉校验会让所有人都能 MITM，
+    # 正确做法是把证书弄对，而不是把校验弄没。别在这里加"跳过 TLS 校验"的配置项。
+    uris: ${ES_URIS:https://465ma.com:9443}
+    username: ${ES_USERNAME:elastic}
+    password: ${ES_PASSWORD:vmt9YkxD9wWp5+9w8BlW}
+    connect-timeout: 3000
+    # 读超时是搜索 P95 指标的兜底。设成 10s 意味着最慢的查询会在 10s 后失败 ——
+    # 比让它拖到 60s 才失败更好，因为后者会占满连接池并引发连锁超时。
+    socket-timeout: 10000
+    failure-node-timeout: 30000
+    max-page-size: 100
+    # 必须与索引 settings 里的 max_result_window 保持一致，
+    # 否则会出现「服务端认为还能翻页、ES 却返回 Result window is too large」的矛盾。
+    max-result-window: 10000
+    bulk-batch-size: 500
+
+  jwt:
+    # 【必须通过环境变量注入】HS256 要求密钥至少 32 字节。
+    # 这个默认值只为了让本地开发能跑起来，生产环境若忘记覆盖它，
+    # 任何人都能用这个公开的密钥伪造管理员令牌。
+    secret: ${KUMA_JWT_SECRET:kuma-search-local-dev-secret-key-change-me-in-production}
+    access-token-ttl: 7200        # 2 小时
+    refresh-token-ttl: 604800     # 7 天
+    issuer: kuma-search
+    header: Authorization
+    token-prefix: "Bearer "
+
+  auth:
+    login:
+      # 登录接口的防爆破总开关。本地压测/调试时可以关掉，免得自己把账号试锁了。
+      # 【生产环境不要关】关掉之后 /api/auth/login 就是一道没有上限的口子，
+      # 攻击者可以离线字典 + 在线并发把任何一个弱密码账号撞开。
+      guard-enabled: ${KUMA_LOGIN_GUARD_ENABLED:true}
+      # 同一账号连续失败 5 次后锁定 15 分钟。
+      # 这里的取舍是「防爆破强度」对「误伤正常用户」：阈值再低，输错两次密码就被锁的体验无法接受；
+      # 再高则给了攻击者更多尝试次数。5 次是业界常见取值。
+      max-failures-per-account: 5
+      account-lock-seconds: 900
+      # 同一来源 IP 每分钟失败 20 次后拒绝。计的是**失败数**而不是请求数，
+      # 因为这个桶在反向代理后面是全局共享的，按请求数会在登录高峰把所有人挡在外面。
+      # 要让这里拿到真实客户端 IP，需要配置 server.tomcat.remoteip.*，见 docs/06-security.md。
+      max-failures-per-ip: 20
+      ip-window-seconds: 60
+
+    # =================================================================================
+    #  邮箱验证码与发信
+    #
+    #  ⚠️ 这里的 enabled 默认是 **true**（本部署打开邮件验证码），
+    #     而 KumaSearchProperties.Auth.Email 里的默认值是 false ——
+    #     两者不矛盾，是两层不同的"默认"：
+    #       · Java 默认 false 是**组件的默认姿态**：一个未配置邮箱的部署
+    #         （例如只跑了 core 模块、或测试环境没有邮箱）不该因为缺少凭据起不来，
+    #         也不该悄悄地把三条接口放开。
+    #       · 本文件默认 true 是**这份部署的选择**：它就是要用邮箱验证码。
+    #     关闭时 /api/auth/email-code、/api/auth/register、/api/auth/login/email
+    #     统一返回「功能未开通」，而**不是**放行不校验 ——
+    #     验证码是这三条链路的凭证本身，没有它就无所谓"校验通过"。
+    #
+    #  ⚠️ 改这一块时请连着看 KumaSearchProperties.Auth.Email 的字段注释，
+    #     那里的默认值与这里的默认值必须能对得上（对不上的表现是
+    #     "改了一个地方，线上行为没变"）。
+    #
+    #  开启前必须先完成（见 docs/08-roadmap.md §6.1）：
+    #    ① 一个能发信的邮箱账号 + 它的连接参数（当前是 QQ 邮箱 SMTP，见文件顶部的 spring.mail.*）；
+    #    ② AJ-Captcha 接入并实测锁定版本 —— 发码接口**强制**要求通过滑块，
+    #       否则每次调用都是一封真金白银的邮件，邮件额度就是免费的攻击面。
+    # =================================================================================
+    email:
+      enabled: ${KUMA_EMAIL_ENABLED:true}
+
+      # ------------------------------------------------------------------------------
+      # 发信方式：aliyun（DirectMail HTTP RPC）或 smtp（标准 SMTP）。
+      #
+      # ⚠️ 两者是**互斥装配**，不是"配了哪个用哪个"的优先级关系。
+      #    EmailCodeService 用的是 ObjectProvider#getIfAvailable()，
+      #    同时存在两个 MailSender 会直接抛 NoUniqueBeanDefinitionException ——
+      #    而且是启动时才炸。Java 侧 @ConditionalOnProperty 的 matchIfMissing 在
+      #    aliyun 那一边，所以"完全没配 provider"走的是 aliyun（保持既有部署行为不变）；
+      #    本文件显式写了 smtp，因此这里走的是 SMTP。
+      #
+      # smtp 的连接参数在**文件顶部的 spring.mail.* 块**（Spring Boot 标准键），
+      # 不在 kuma.auth.email 下面 —— 只有"发件人是谁"留在这边（见 account-name）。
+      #
+      # 从 smtp 切到 aliyun 时：把 spring.mail.* 整块注释掉（否则 Boot 仍会创建
+      # JavaMailSender，虽然不冲突，但会让人以为 SMTP 还配着），
+      # 并补上下面那组 Aliyun AK —— 它们刻意没有默认值，没配就启动失败。
+      # ------------------------------------------------------------------------------
+      provider: ${KUMA_EMAIL_PROVIDER:smtp}
+
+      # 验证码有效期。5 分钟是"用户来得及去看邮件"与"泄露窗口尽量短"的平衡点。
+      code-ttl-seconds: 300
+      # 同一验证码允许失败 5 次。达上限即作废验证码本身，攻击者必须重新触发发码，
+      # 而发码受 60 秒节流 + 每日配额约束 —— 6 位数字的安全性来自这套组合，不是来自长度。
+      max-attempts: 5
+      # 同邮箱两次发码的最小间隔。防"用户连点几下收到十几封邮件"，
+      # 而发信域名信誉一旦被用户举报打下去，所有用户的验证码都会进垃圾箱。
+      send-interval-seconds: 60
+      # 单邮箱日上限。防一个邮箱被打成筛子。
+      daily-limit-per-email: 10
+      # 全局日上限 —— **唯一一道防"发信额度被烧穿"的闸**。
+      #
+      # 取值随发信方式而变，换 provider 时必须一起改：
+      #   · aliyun：DirectMail 免费额度为 2000 封总量 / 200 封每日（超出按量计费，约 2 元/千封），
+      #     150 留了 25% 余量给运维手工发信。购买资源包后必须同步调大，否则付了钱还是发不出去。
+      #   · smtp（当前）：QQ 个人邮箱的日发信上限**官方不公布**，超限的表现是
+      #     550 Sender frequency limited（当天再发都失败），且有把账号判定为异常的风险。
+      #     50 是"限额未知时先把墙放在自己能看见的地方"的保守取值：
+      #     定低了最坏是当天注册不了（用户可见、当天就能发现并改大），
+      #     定高了最坏是账号被风控（不可逆）。
+      #     等实际观察够久，再按实测值往上调，不要凭传闻调。
+      #
+      # 达 80% 时应当告警 —— 见 docs/07-deployment.md §12.1。
+      global-daily-limit: 50
+
+      # ------------------------------------------------------------------------------
+      # 阿里云凭据（**当前 provider=smtp，这一组不生效**，切回 aliyun 时才需要）。
+      # **只授 DirectMail 发信权限，不要用主账号 AK。**
+      # 泄露的后果差别很大：发信 AK 泄露 = 别人用你的域名发垃圾邮件；
+      # 主账号 AK 泄露 = 整个云账号。这里刻意不给默认值 —— 没配就启动失败，
+      # 而不是带着一个空 AK 跑到第一次发信才报错（见 AliyunDirectMailSender#validateCredentials）。
+      #
+      # 注意：provider=smtp 时 AliyunDirectMailSender 这个 Bean 根本不会被创建，
+      # 因此下面留空**不会**导致启动失败，也不会有人提示你"这里还差凭据"。
+      # 它只是一组躺着的空配置，别误以为当前发信走的是阿里云。
+      # ------------------------------------------------------------------------------
+      access-key-id: ${KUMA_DM_AK:}
+      access-key-secret: ${KUMA_DM_SK:}
+      # 发件人地址（From），两条发信链路**共用这一项**。
+      #
+      # ⚠️ 必须与 spring.mail.username 指向同一个真实邮箱：多数 SMTP 服务器
+      #    （QQ 尤其严格）会拒收 From 与登录账号不一致的邮件，
+      #    应答码 550/553 "sender address rejected" —— 那是收信方的策略，与本项目无关。
+      #
+      # 因此这里的默认值直接取自 MAIL_USERNAME，与上面 spring.mail.username 是**同一个变量**：
+      # 只要改一个环境变量，两处一起变，不存在"改了一处忘了另一处、
+      # 结果启动正常但发信被拒"的中间态。要用阿里云时再用 KUMA_DM_ACCOUNT 覆盖
+      # （那时值应落在控制台已验证的发信域名下，建议用子域名如 notice.465ma.com 隔离信誉）。
+      account-name: ${KUMA_DM_ACCOUNT:${MAIL_USERNAME:1749115603@qq.com}}
+      from-alias: ${KUMA_DM_FROM_ALIAS:KumaSearch}
+      region-id: ${KUMA_DM_REGION:cn-hangzhou}
+      # 单向通知邮箱，不接收回复。
+      reply-to-address: false
+      subject-template: "【KumaSearch】%s验证码"
+      # 【仅用于本地开发】没有真实发信额度时靠日志拿验证码。
+      # 生产打开等于把验证码写进日志文件：任何有日志读取权限的人都能登录任意邮箱账号。
+      log-code: ${KUMA_EMAIL_LOG_CODE:false}
+
+  # ===================================================================================
+  #  匿名接口限流
+  #
+  #  搜索改成匿名可用之后，这些接口就是无门槛、无上限、背后接着 ES 的公开入口。
+  #  限流是匿名化的**正确代价**，不是可选的优化。详见 RateLimitGuard 的类注释。
+  #
+  #  ⚠️ 阈值口径按「前端一次操作发几个请求」来定，不是按「一次搜索」来定：
+  #     结果页会并发发两个请求（站内 + 网页采集），若两个共用一个 30 次/分钟的桶，
+  #     用户点两次「下一页」就会被拦 —— 这是最容易在联调时被误判成「限流坏了」的地方。
+  # ===================================================================================
+  rate-limit:
+    # 只在本地压测/调试时关。生产关掉后 ES 直接对外裸奔。
+    enabled: ${KUMA_RATE_LIMIT_ENABLED:true}
+    window-seconds: 60
+
+    # POST /api/search
+    search:
+      ip-limit: ${KUMA_RATE_SEARCH_LIMIT:30}
+    # GET /api/search/suggest —— 前端每次击键都会触发，阈值必须显著放宽
+    suggest:
+      ip-limit: ${KUMA_RATE_SUGGEST_LIMIT:120}
+    # GET /api/search/hot
+    hot:
+      ip-limit: ${KUMA_RATE_HOT_LIMIT:60}
+    # GET /api/search/types —— 搜索页初始化时取一次可检索类型列表。
+    # 与 hot 同档：页面加载触发，多开几个标签页也不该被误伤。
+    types:
+      ip-limit: ${KUMA_RATE_TYPES_LIMIT:60}
+    # POST /api/auth/email-code
+    # 窗口取 1 小时而不是 1 分钟：这个接口的代价是「发一封真金白银的邮件」，
+    # 分钟级窗口意味着攻击者每分钟都能刷满一轮，而邮箱日配额早就被打穿了。
+    email-code:
+      ip-limit: ${KUMA_RATE_EMAIL_CODE_LIMIT:10}
+      window-seconds: 3600
+
+    # POST /api/content/submit、PUT /api/content/submit（前台用户投稿）
+    # ⚠️ 这是唯一一个同时按 IP 与用户两个维度计数的档位，两个桶各自独立、任一命中即拦：
+    #    - 只按 IP：NAT / 校园网出口后面的人会互相顶掉额度，误伤与投稿人无关；
+    #    - 只按用户：注册小号零成本，等于没有限制。
+    # 窗口 1 小时：真人写手的节奏是"写完一篇发一篇"，10 条/小时足够；
+    # 分钟级窗口对刷稿没有意义（每个窗口照样能投 10 条）。
+    content-submit:
+      ip-limit: ${KUMA_RATE_SUBMIT_IP_LIMIT:60}
+      user-limit: ${KUMA_RATE_SUBMIT_USER_LIMIT:10}
+      window-seconds: 3600
+
+    # PUT /api/auth/profile/password —— 防拿改密接口暴力猜原密码。
+    # ⚠️ 只配用户维度（ip-limit 默认 0 = 不限流）：要防的是"猜某个账号的原密码"，
+    #    这件事只与账号有关，而 IP 维度会误伤共用出口的用户。
+    profile-password:
+      user-limit: ${KUMA_RATE_PROFILE_PASSWORD_LIMIT:5}
+      window-seconds: 3600
+    # PUT /api/auth/profile/email —— 限"换绑动作"的频率。
+    # ⚠️ 与发信侧的闸不是同一件事：邮箱节流与日配额在 EmailCodeService 里，管的是发信成本。
+    profile-email:
+      user-limit: ${KUMA_RATE_PROFILE_EMAIL_LIMIT:5}
+      window-seconds: 3600
+
+    # 热词去重窗口：同一 IP + 同一归一化关键词在该窗口内只计一次热词。
+    # ⚠️ 只抬高刷榜成本，挡不住分布式刷量 —— 热词榜仍需人工巡检。
+    hot-dedup-enabled: ${KUMA_HOT_DEDUP_ENABLED:true}
+    hot-dedup-seconds: 600
+
+  # ===================================================================================
+  #  人机校验（滑块图形验证码，AJ-Captcha）
+  #
+  #  ⚠️ 默认 false，且关闭时注册 / 邮箱码登录 / 发码三个入口**拒绝服务**，
+  #     而不是跳过校验。同理：一个"关掉就等于不校验"的开关，
+  #     配置遗漏不会产生任何可观察的错误。
+  #
+  #  这里**没有**接口路径配置项。上游 starter 的默认路径 /captcha/get 与 /captcha/check
+  #  确实会同时踩两个坑（不在 /api/** 下会被兜底鉴权拦成 401；而 Nginx 只代理
+  #  /kumasearch/api/ 前缀，请求根本到不了后端），但解决办法不是"用配置改路径"——
+  #  上游核心包不含任何控制器，这两个端点就是本项目 CaptchaController 提供的，
+  #  路径是它 @RequestMapping 上的字面量。曾经写在下面那两个 get-url/check-url
+  #  是基于误解加上去的（上游Const 里根本没有这两个键），已删除。
+  #
+  #  下面的键名是 kuma.* 风格，由 AjCaptchaConfig 翻译成上游要的 captcha.*
+  #  （注意上游不带 aj. 前缀 —— 那层是 starter 加的，本项目不用 starter，
+  #   原因见 AjCaptchaConfig 的类注释：它的自动配置写在 spring.factories 里，Boot 3 不读）。
+  # ===================================================================================
+  captcha:
+    enabled: ${KUMA_CAPTCHA_ENABLED:true}
+    # 只有块拼图。其它类型（点选文字、旋转）需要重写前端交互，不是改配置就能切的事。
+    type: blockPuzzle
+    # 缓存类型。生产**必须**是 redis：local 是进程内缓存，多实例部署时
+    # 取图与校验可能落在不同节点，表现为"偶尔提示验证码已失效"。
+    cache-type: ${KUMA_CAPTCHA_CACHE:redis}
+    # 坐标容差（像素）。它直接等于"猜中的难度"：容差越大，滑块越弱。
+    # 上游默认 5，这里取 10 是为了让手机端用户不至于因为几像素的偏差反复失败。
+    slip-offset: 10
+    water-mark: KumaSearch
+    # ------------------------------------------------------------------------------
+    # 【只能是 false，配成 true 会拒绝启动】
+    # 打开它要求**浏览器端**用下发的密钥把坐标加密后提交（上游用 AES-ECB，
+    # 而 Web Crypto 不提供 ECB，只能前端手写一份 AES），
+    # 且后端将再也算不出那枚一次性凭证（见 AjCaptchaConfig 的启动自检说明）。
+    # 它也不构成安全能力：密钥必须下发给前端才能用，对客户端必然可见。
+    # ------------------------------------------------------------------------------
+    aes-status: false
+    # 干扰项数量。0 = 底图上不加干扰噪点。调大能略微提高打码成本，也会降低底图观感。
+    interference-options: 0
+    cache-number: 1000
+    timing-clear-seconds: 180
+    # 上游自带的接口频次限制。本项目另有一套按 IP 的匿名限流（见 kuma.rate-limit），
+    # 因此这里保持关闭，避免两层限流叠加后用户遇到"没有原因也说操作频繁"。
+    req-frequency-limit-enable: false
+    # 滑块凭证的一次性消费 TTL。防的是"同一枚凭证在校验通过后被重放"，
+    # 因此这个值必须不短于凭证本身可能被重放的时间窗。
+    verification-ttl-seconds: 120
+
+  # ===================================================================================
+  #  网页采集
+  #
+  #  ⚠️ **这里默认开启**（Java 侧 KumaSearchProperties.Crawl.enabled 的默认值是 false，
+  #     本文件用环境变量把它覆盖成了 true）。采集会**对外发起真实请求**，
+  #     关掉它只需设 KUMA_CRAWL_ENABLED=false。
+  #
+  #  为什么默认开：采集是本项目"站外内容"这一半的全部来源，而这个功能的故障形态是
+  #  **沉默**的 —— 关着的时候调度器不排任何任务，日志里没有任何错误，
+  #  现象与"配好了但一条都没采到"一模一样。默认关等于把一次配置遗漏伪装成一次故障。
+  #
+  #  真正的失控保护不在这个开关上，而在三处：种子站白名单（采什么）、
+  #  `t_crawl_seed.max_pages` / `qps`（采多少、多快）、以及 robots 判定。
+  #  上线前请确认：种子站清单、robots 策略、内容发布策略（kuma.crawl.auto-publish）、
+  #  以及举报与下架的受理方式（法定义务，见 docs/08-roadmap.md §六）。
+  # ===================================================================================
+  crawl:
+    enabled: ${KUMA_CRAWL_ENABLED:true}
+    scan-interval-millis: 30000
+    batch-size: 20
+    # 按域名限速是另一层约束，两者都要满足
+    concurrency: 4
+    connect-timeout-millis: 5000
+    # 抓的是别人的站点，超时要给足，但不能不设
+    read-timeout-millis: 10000
+    # 单页最大读取字节数。超过直接截断 —— 防止一个坏 URL 把内存吃光
+    max-content-bytes: 2097152
+    # 必须能标识本站并提供联系方式：这是「礼貌爬取」的一部分，
+    # 也便于对方在有异议时找到人（对方找不到人，下一步就是封 IP）。
+    user-agent: ${KUMA_CRAWL_UA:KumaSearchBot/1.0 (+https://465ma.com/bot)}
+    max-retry: 3
+    retry-backoff-seconds: 60
+    default-qps: 0.5
+    # 抓取租约：超过这个时间仍是「抓取中」的记录会被回收为待抓。
+    # 只在进程崩溃/被杀时触发，是单机版的兜底。
+    lease-timeout-seconds: 300
+    robots-cache-seconds: 3600
+    # 词库改完不必重启进程
+    sensitive-reload-seconds: 300
+    # ------------------------------------------------------------------------------
+    # 【发布策略】采集到的内容直接发布（status=1），还是全部留在待审队列（status=0）。
+    #
+    # 默认 true（采集即发布）。理由是采集是持续的、人工审核是间歇的，全待审时的现象是
+    # "爬虫一直在跑、搜索结果一直是空的" —— 采集速度永远大于审核速度，积压只增不减。
+    # 本项目的采集范围是白名单种子站（不是全网），因此默认放行 + 批量驳回是更合适的默认。
+    #
+    # ⚠️ 敏感词命中的内容**不受本开关影响**：它在 CrawlPipeline 里被自动置为驳回（status=2）
+    # 并进入待审队列等人复核，这个判定发生在发布之前。因此本开关改变的是"默认是否可见"，
+    # 不是"是否有审核" —— 关掉它，词库误报就会静默沉底。
+    #
+    # 关掉它 = 回到全量待审（每条都要人工放行，用 POST /api/admin/crawl/audit/batch 批量处理）。
+    auto-publish: ${KUMA_CRAWL_AUTO_PUBLISH:true}
+    # ------------------------------------------------------------------------------
+    # 正文抽取实现：jsoup（默认）或 regex。
+    #
+    # jsoup 强在两点：把 HTML 真的解析成树（正则处理不了未闭合标签、注释嵌套、
+    # 表格结构），以及剔除模板噪声（导航栏/页脚/侧边栏/评论区的文字会被正则版
+    # 原样当成正文，于是每一页的摘要都带着一整份站点导航）。
+    # regex 是零依赖的对照实现，保留的原因：依赖出问题时还有一条能跑的路径；
+    # 以及排查"某批页面被跳过"时可以切过去，分清是模板剔除剔过头还是页面本来没正文。
+    #
+    # ⚠️ 两者的模板剔除是「宁可少剔」：剔多了的症状是正文变短 → 低于最小长度
+    #    → 整页被判为跳过，而日志里只有一行 DEBUG。真遇到时先用 regex 跑一遍对比。
+    # ------------------------------------------------------------------------------
+    extractor: ${KUMA_CRAWL_EXTRACTOR:jsoup}
+    # ------------------------------------------------------------------------------
+    # 【生产必须保持 false】是否允许抓取内网/环回地址。
+    #
+    # 种子站是可配置的，而配置项一旦能指向 127.0.0.1 或 169.254.169.254，
+    # 这个采集器就变成了打内网的 SSRF 工具 —— 云厂商的元数据服务
+    # （169.254.169.254，里面有临时凭据）正好在这个范围里。
+    # 只在写单测时打开。
+    # ------------------------------------------------------------------------------
+    allow-private-hosts: ${KUMA_CRAWL_ALLOW_PRIVATE_HOSTS:false}
+
+  cache:
+    local-enabled: true
+    local-max-size: 10000
+    # L1 的 TTL 刻意远短于 L2：多实例部署时 L1 各存各的，
+    # 这个值就是「A 实例的修改在 B 实例上最多多久可见」的上限。
+    local-ttl-seconds: 60
+    redis-ttl-seconds: 300
+    # 搜索结果缓存。这个值同时决定了「新增内容多久能被搜到」（在缓存命中的查询上），
+    # 调大会显著提高命中率，但会拉长内容可见延迟。60 秒是两者的平衡点。
+    search-ttl-seconds: 60
+    suggest-ttl-seconds: 600
+    # 说明：这里没有 hot-word-ttl-seconds。热词是直接从 Redis ZSET 读的，中间没有缓存层，
+    # 因此不存在"热词缓存 TTL"这个东西；ZSET 自身的 7 天保留期写在 HotWordServiceImpl 里。
+    # 保留一个不起作用的开关只会让运维白调（曾经就有这个项，且代码从不读取）。
+    null-ttl-seconds: 30
+    lock-wait-millis: 500
+
+  search:
+    default-page-size: 10
+    fuzzy-max-expansions: 50
+    fuzzy-prefix-length: 1
+    suggest-size: 10
+    hot-word-size: 10
+    summary-length: 120
+    facet-size: 10
+    # 搜索日志落库是异步的（见 AsyncConfig 的 searchLogExecutor）。
+    # 压测时把它关掉可以排除日志线程池的干扰。
+    search-log-enabled: true
+    max-filter-count: 20
+    max-facet-count: 5
+
+  # ===================================================================================
+  #  联想词（灌词）
+  #
+  #  联想索引 kuma_{typeCode}_suggest 里的内容全部由"灌词"产生：定时全量
+  #  （SuggestRebuildJob）负责存量与失败兜底，发布/审核时增量同步
+  #  （IndexEventHandler → SuggestWordService）。只有 field_config 里声明了
+  #  suggest=true 的类型才有这个索引，灌词、建索引、查询三处共用这一个开关。
+  # ===================================================================================
+  suggest:
+    # 每个类型最多灌多少条建议词，按 biz_weight 降序取前 N。
+    #
+    # completion 的 FST 是常驻堆内存的，而采集类内容的条数会持续增长，因此必须有上限。
+    # 默认 5000 条的 FST 在几 MB 量级。到达上限时日志里会有一条明确的 WARN
+    # （"已达到联想词上限，仅灌入了权重最高的部分"），不会静默截断得无声无息。
+    max-docs-per-type: ${KUMA_SUGGEST_MAX_DOCS:5000}
+    # 定时全量灌词的开关。关掉后只有"发布时增量"这一条路径 ——
+    # 存量数据（上线前就已发布的内容）将永远不在联想索引里，一般不要关。
+    rebuild-enabled: ${KUMA_SUGGEST_REBUILD_ENABLED:true}
+    # 全量灌词的间隔（毫秒），默认 6 小时。
+    #
+    # 新增内容的联想可见性由"发布时增量"保证，不靠这个周期，因此它可以长。
+    # 也不该调到分钟级：每轮都是"删索引 → 重建 → 重灌"（分析器与 max_input_length
+    # 都在 settings 里，ES 不允许改已有索引的 settings，只能重建），
+    # 重建期间联想是空的。
+    rebuild-interval-millis: ${KUMA_SUGGEST_REBUILD_INTERVAL:21600000}
+
+  sync:
+    batch-size: 500
+    incremental-enabled: true
+    reconcile-enabled: true
+    # 增量扫描的间隔（毫秒）。这个值直接决定「新增内容多久能自动进 ES」——
+    # 它是写入可见延迟的三个组成部分里最大的一项（另两个是 ES 的 refresh_interval
+    # 和缓存 TTL）。调小能让内容更快可搜，代价是更频繁地扫 t_search_content。
+    incremental-interval-millis: 30000
+    # 全量对账的间隔（毫秒），默认 30 分钟。
+    # 对账本身要统计 MySQL 与 ES 的文档数并抽样比对，不是轻量操作，不要调得太频繁。
+    reconcile-interval-millis: 1800000
+    max-retry: 5
+    retry-backoff-seconds: 10
+    reconcile-tolerance: 0
+    # 增量扫描的回溯秒数。多扫几秒只会重复投递一些（幂等的）事件，
+    # 而漏掉一秒的数据会造成永久的不一致。
+    overlap-seconds: 5
+    # 自动建索引：定期检查每个启用中的类型有没有索引，缺了就建，
+    # 源表已有已发布数据时接着全量灌进去（详见 IndexBootstrapJob 的类注释）。
+    #
+    # 【为什么默认开】它只补"缺失"，从不碰已经存在的索引（判断条件是 !exists），
+    # 所以它没有覆盖线上索引的能力，开着的最坏结果只是多建了一个本该建的索引。
+    # 反过来，关掉它的代价是一个没有失败信号的状态：新环境忘了建索引时的表现是
+    # "搜索返回空结果"，会被读成"还没收录内容"。
+    auto-create-enabled: ${KUMA_SYNC_AUTO_CREATE_ENABLED:true}
+    # 检查间隔（毫秒），默认 10 分钟。缺索引需要人工介入才能产生（新环境首次启动、
+    # 或有人手工删了索引），不是持续变化的数据，所以周期可以长。
+    # 注意：@Scheduled 的 fixedDelay 让第一次执行在启动后立即发生，
+    # 因此新环境起来后几秒内就会建好索引，不必等满一个周期。
+    auto-create-interval-millis: ${KUMA_SYNC_AUTO_CREATE_INTERVAL:600000}
+
+  mq:
+    # db-outbox（默认，推荐） / memory（仅本地开发） / rocketmq（预留，尚未实现）
+    type: ${KUMA_MQ_TYPE:db-outbox}
+    outbox-scan-interval-millis: 1000
+
+  cors:
+    # 允许跨域访问的**前端源**（scheme + host + port，不含路径）。默认是本地前端 dev server。
+    #
+    # 绝大多数情况下这一项根本用不上：前端在开发期经 Vite proxy、生产期经 Nginx 反代访问接口，
+    # 浏览器看到的是同源请求，不触发 CORS。只有「前端绕过代理、直接请求后端端口」时才生效。
+    # 生产环境应改成实际的域名（如 https://search.example.com）。
+    #
+    # 注意别把后端端口 18082 填进来 —— 那等于说"后端自己跨域访问自己"，没有任何意义。
+    allowed-origins: ${KUMA_CORS_ALLOWED_ORIGINS:http://localhost:5173}
+
+  # ===================================================================================
+  #  接口文档（Swagger UI）
+  #
+  #  入口：http://localhost:18082/swagger-ui.html
+  #  分组、认证方式、以及"为什么默认关"写在 SwaggerConfig 的类注释里。
+  #
+  #  ⚠️ 这一项与下面的 springdoc.api-docs.enabled 是**同一个开关的两半**：
+  #     这里控制"注册不注册分组 Bean"，那里控制"注册不注册 HTTP 端点"。
+  #     只改一处会出现"分组配好了但页面打不开"或"页面能打开但分组是空的"。
+  #     实际的开关值只写在这里，springdoc 那边引用本属性（见下面的 ${kuma.swagger.enabled}），
+  #     不要在两处各写一个 ${SWAGGER_ENABLED:false} —— 那样改环境变量名时容易漏改一处。
+  # ===================================================================================
+  swagger:
+    # 默认 false。要开就设环境变量 SWAGGER_ENABLED=true，不必改这个文件。
+    #
+    # 【为什么默认关，而不是"默认开、生产再关"】默认值是要在无人操作的情况下生效的那个。
+    # 生产环境漏配是常态，漏配的结果必须落在安全的一侧：默认关，最多是本地看不了文档；
+    # 默认开，则是管理端 62 个接口的参数结构悄悄挂在了公网上。
+    enabled: ${SWAGGER_ENABLED:false}
+
+# =====================================================================================
+#  接口文档组件的自身配置
+#
+#  这里的 enabled 一律引用 kuma.swagger.enabled，**不要**直接写 ${SWAGGER_ENABLED:false}，
+#  避免"开关有两处真相"。关掉时 springdoc 不注册 /swagger-ui/** 与 /v3/api-docs/**，
+#  请求落到 NoResourceFoundException，被 GlobalExceptionHandler 包成
+#  HTTP 200 + {"code":10001,"message":"系统内部错误"}（实测结论，**不是 404 也不是 403** ——
+#  本项目所有业务失败都用 200 承载）。判断开关开没开：看响应体里有没有 openapi 字段，
+#  不要看状态码；也不要因为日志里那条 NoResourceFoundException 的 ERROR 栈去查故障。
+# =====================================================================================
+springdoc:
+  api-docs:
+    enabled: ${kuma.swagger.enabled}
+  # 关掉文档的产物缓存。默认开启缓存时，改完注解重启后页面可能仍显示旧内容，
+  # 让人怀疑"是不是改动没生效"，然后又去改一遍本来就对的代码。
+  cache:
+    disabled: true
+  swagger-ui:
+    enabled: ${kuma.swagger.enabled}
+    # 关掉"默认分组"。不加这一项时下拉框里会多出一个由 springdoc 自动生成的
+    # default 分组（内容与 SwaggerConfig 里那 5 个分组完全重复），
+    # 看的人会以为同一个接口配了两遍。
+    disable-swagger-default-url: true
+    # 展开到参数级别，省得每看一个接口都要先点一次开。
+    doc-expansion: list
+    # 同一个控制器内按路径排序。默认是 springdoc 的发现顺序，即 JVM 给出的方法顺序，
+    # 它只"通常"等于源码里的声明顺序、并不保证 —— 在 IndexTypeController
+    # 这种 12 个端点的控制器里，顺序一乱就得反复扫视整页找那个接口。
+    operations-sorter: alpha
+    # 顶部的 tag 过滤框。62 个端点平铺时，有个输入框能直接过滤掉不相关的组。
+    filter: true
+    # 试调接口时把请求体预填成示例值，而不是一个空对象。
+    try-it-out-enabled: true
+    display-request-duration: true
+
+# =====================================================================================
+#  监控
+# =====================================================================================
+management:
+  endpoints:
+    web:
+      exposure:
+        # 只暴露 health 与 info。metrics/prometheus 若需要，应先在
+        # SecurityConfig 里给它加上认证 —— 指标数据会泄漏业务规模与内部结构。
+        include: health,info
+  endpoint:
+    health:
+      show-details: when-authorized
+      probes:
+        # 提供 /actuator/health/liveness 与 /readiness，
+        # 供 K8s 的存活探针与就绪探针使用（两者语义不同，混用会导致滚动更新时丢流量）。
+        enabled: true
+
+logging:
+  # %X{requestId} 输出 RequestIdFilter 放进 MDC 的追踪 ID。
+  # 不配这个占位符的话，ID 只是被安静地塞进了 MDC 而没有落到任何日志行里，
+  # 于是"回写响应头 → 用户报错时贴给你 → 用它搜日志"这条排查链路会在最后一步断掉。
+  pattern:
+    console: "%d{yyyy-MM-dd HH:mm:ss.SSS} %-5level [%X{requestId:-}] %logger{36} - %msg%n"
+  level:
+    root: INFO
+    com.kuma.search: ${LOG_LEVEL:INFO}
+    # MyBatis 的 SQL 日志。默认关闭：它会打印每条语句与参数，
+    # 在高 QPS 下既拖慢应用，也会把用户搜索词写进日志文件（隐私问题）。
+    # 排查 SQL 问题时再临时打开。
+    com.kuma.search.repository.mapper: ${MAPPER_LOG_LEVEL:WARN}

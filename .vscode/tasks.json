@@ -1,0 +1,26 @@
+{
+    // 运行方式：⌘⇧P → Tasks: Run Task，或 ⌘⇧B 跑默认的那一条（build 组）。
+    // 这两条的存在理由是：target/classes 有两个写入者（Maven 与 IDE 的 Java 语言服务器），
+    // 后者一旦退回自身的合规级别就会写出 Java 25 的字节码覆盖掉 Maven 的 Java 17 ——
+    // 而它在 `./mvnw package` 上完全看不出来，只在运行时报 UnsupportedClassVersionError。
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "Java 17：Maven 干净重编译",
+            "type": "shell",
+            "command": "./mvnw -o clean compile -DskipTests",
+            "group": { "kind": "build", "isDefault": true },
+            "problemMatcher": [],
+            "presentation": { "reveal": "always", "panel": "shared", "clear": true }
+        },
+        {
+            // 以 -q 调用：只有出问题时才有输出，适合放在运行前手动过一遍
+            "label": "Java 17：检查字节码版本",
+            "type": "shell",
+            "command": "./scripts/check-class-version.sh -q",
+            "group": "test",
+            "problemMatcher": [],
+            "presentation": { "reveal": "always", "panel": "shared", "clear": true }
+        }
+    ]
+}

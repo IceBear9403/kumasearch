@@ -1,0 +1,48 @@
+{
+    "java.debug.settings.onBuildFailureProceed": true,
+
+    // ==========================================================================================
+    //  让 IDE 与 Maven 产出同一种字节码（major version 61 = Java 17）—— 不要删除这一段
+    //
+    //  症状：运行时报
+    //    UnsupportedClassVersionError: com/kuma/search/web/KumaSearchApplication
+    //    has been compiled by a more recent version of the Java Runtime (class file version 69.0),
+    //    this version of the Java Runtime only recognizes class file versions up to 61.0
+    //  而 `./mvnw package` 本身完全正常、jar 也是对的 —— 只有从 IDE 启动或直接跑
+    //  target/classes 才会炸。原因不是"POM 配错了 JDK"，而是**写入 target/classes 的另有其人**：
+    //
+    //  ① 谁在写：VSCode 的 Java 扩展（redhat.java）自己编译源码，输出到与 Maven 相同的
+    //     target/classes，会覆盖 Maven 的产物。它给出的合规级别取决于**它的 Maven 导入是否成功**：
+    //     导入成功 → 用 pom 里的 maven.compiler.release=17 → 61；
+    //     导入失败 → 退回它自身运行时的默认级别 → 见②。
+    //  ② 退回多少：redhat.java 1.57.0 自带 JRE 25（`jre/25.0.4.1-macosx-aarch64`），
+    //     所以退回后的默认合规级别是 25 → major version 69。
+    //  ③ 为什么导入会失败过：语言服务器把 Maven 的用户/全局 settings 文件路径透传给 Maven，
+    //     而用户级 settings.json 里那两个路径是 `D:\work\...\settings-hedian.xml`（Windows 机器上
+    //     留下的），在本机不存在，Maven 直接以
+    //       "The specified user settings file does not exist"
+    //     终止 —— 导入因此失败，pom 里的 release=17 就从来没被读到过。
+    //     那两行已从用户级 settings.json 移除（备份在同目录的 settings.json.bak-*）。
+    //
+    //  ⚠️ **不要把 java.jdt.ls.java.home 指向 JDK 17。** 本条是踩过的坑：该设置的作用是选
+    //  "启动语言服务器的 JDK"，而 redhat.java 1.57.0 对它的要求是 **"JDK 25 or more recent"**
+    //  （该设置自己的说明文字就是这么写的）。指到 17 不会被采纳，语言服务器仍然落到自带的
+    //  JRE 25 上，于是"钉死 17"这个写法看着生效、实则无效 —— 真正决定字节码版本的不是它，
+    //  而是下面这个 runtimes 映射 + pom 里的 release。
+    //
+    //  协议：**字节码版本由 pom 决定，IDE 只负责读它。** 父 pom 的 `<properties>` 与
+    //  maven-compiler-plugin 各写了一次 release=17（后者不能省），任何只读 pom 的工具都能拿到 17。
+    //  改动 pom 的编译配置后，若 IDE 行为没跟着变，执行一次
+    //  `Java: Clean Java Language Server Workspace` 再重载窗口 —— 那是导入缓存的问题，不是配置错了。
+    // ==========================================================================================
+    "java.configuration.runtimes": [
+        {
+            "name": "JavaSE-17",
+            "path": "/opt/homebrew/opt/openjdk@17/libexec/openjdk.jdk/Contents/Home",
+            "default": true
+        }
+    ],
+    // 让 pom 的改动自动应用到 IDE（默认是 interactive，会弹框询问，容易点掉后一直不生效）
+    "java.configuration.updateBuildConfiguration": "automatic",
+    "java.import.maven.enabled": true
+}
